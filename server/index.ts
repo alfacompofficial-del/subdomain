@@ -38,6 +38,55 @@ async function getUser(authHeader: string | undefined) {
   return error ? null : user;
 }
 
+// ─── Helper: Render API for Custom Domains ───────────────────────────────────
+async function addRenderCustomDomain(domainName: string) {
+  const RENDER_API_KEY = process.env.RENDER_API_KEY;
+  const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return;
+
+  try {
+    const url = `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/custom-domains`;
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${RENDER_API_KEY}`
+      },
+      body: JSON.stringify({ name: domainName })
+    });
+    console.log(`Successfully requested Render to add domain: ${domainName}`);
+  } catch (err) {
+    console.error('Render API error (add):', err);
+  }
+}
+
+async function removeRenderCustomDomain(domainName: string) {
+  const RENDER_API_KEY = process.env.RENDER_API_KEY;
+  const RENDER_SERVICE_ID = process.env.RENDER_SERVICE_ID;
+  if (!RENDER_API_KEY || !RENDER_SERVICE_ID) return;
+
+  try {
+    const url = `https://api.render.com/v1/services/${RENDER_SERVICE_ID}/custom-domains`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${RENDER_API_KEY}` }
+    });
+    if (!res.ok) return;
+    const data = (await res.json()) as any[];
+    const domainObj = data.find((d: any) => d.customDomain.name === domainName);
+    
+    if (domainObj) {
+      await fetch(`${url}/${domainObj.customDomain.id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${RENDER_API_KEY}` }
+      });
+      console.log(`Successfully requested Render to delete domain: ${domainName}`);
+    }
+  } catch (err) {
+    console.error('Render API error (delete):', err);
+  }
+}
+
 // ─── Wildcard subdomain middleware ────────────────────────────────────────────
 app.use(async (req, res, next) => {
   const host = req.hostname;
@@ -128,6 +177,10 @@ app.post('/api/subdomains', async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+  
+  // Call Render API to add domain
+  await addRenderCustomDomain(`${name}.${MAIN_DOMAIN}`);
+  
   res.status(201).json(data);
 });
 
@@ -151,6 +204,9 @@ app.delete('/api/subdomains/:name', async (req, res) => {
   if (fileList && fileList.length > 0) {
     await supabase.storage.from('sites').remove(fileList.map(f => `${name}/${f.name}`));
   }
+
+  // Call Render API to delete domain
+  await removeRenderCustomDomain(`${name}.${MAIN_DOMAIN}`);
 
   res.json({ success: true });
 });
