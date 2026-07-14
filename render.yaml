@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: subdomain-creator
+    env: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install && npm run build && npm run build:server
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAIN_DOMAIN
+        value: alfacomp.uz
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_API_URL
+        sync: false
+      - key: VITE_MAIN_DOMAIN
+        value: alfacomp.uz
+      - key: FRONTEND_URL
+        value: https://domain.alfacomp.uz
