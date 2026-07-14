@@ -10,9 +10,11 @@
     "build": "vite build && npm run build:server",
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist-server/index.js",
-    "preview": "vite preview"
+    "preview": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.44.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/mime-types": "^3.0.1",
@@ -22,7 +24,8 @@
     "concurrently": "^10.0.3",
     "tsx": "^4.19.4",
     "typescript": "~5.7.2",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "wrangler": "^4.110.0"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.5",
