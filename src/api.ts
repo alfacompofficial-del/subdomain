@@ -10,9 +10,9 @@ export interface Subdomain {
 
 export interface FileInfo {
   name: string;
-  id: string;
+  id: string | null;
   updated_at: string;
-  metadata?: { size: number; mimetype: string };
+  metadata?: { size: number; mimetype: string } | null;
 }
 
 async function authHeader(): Promise<Record<string, string>> {
@@ -59,6 +59,14 @@ export async function apiDeleteFile(subdomain: string, filename: string): Promis
   if (!r.ok) throw new Error((await r.json()).error);
 }
 
+export async function apiDeleteAllFiles(subdomain: string): Promise<void> {
+  const r = await fetch(`${API_URL}/api/subdomains/${subdomain}/files`, {
+    method: 'DELETE',
+    headers: await authHeader(),
+  });
+  if (!r.ok) throw new Error((await r.json()).error);
+}
+
 export async function apiUploadFiles(
   subdomain: string,
   files: File[],
@@ -85,4 +93,14 @@ export async function apiUploadFiles(
     xhr.onerror = () => reject(new Error('Network error'));
     xhr.send(form);
   });
+}
+
+export async function apiImportGitHub(subdomain: string, repoUrl: string): Promise<{ file: string; success: boolean; error?: string }[]> {
+  const r = await fetch(`${API_URL}/api/subdomains/${subdomain}/github`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...await authHeader() },
+    body: JSON.stringify({ repoUrl }),
+  });
+  if (!r.ok) throw new Error((await r.json()).error);
+  return (await r.json()).results;
 }

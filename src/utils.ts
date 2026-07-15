@@ -27,7 +27,8 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-export function fileIcon(name: string): string {
+export function fileIcon(name: string, isFolder = false): string {
+  if (isFolder) return '📁';
   const ext = name.split('.').pop()?.toLowerCase();
   const map: Record<string, string> = {
     html: '🌐', css: '🎨', js: '⚡', ts: '🔷', json: '📋',

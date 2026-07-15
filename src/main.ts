@@ -2,7 +2,7 @@ import './style.css';
 import { supabase, MAIN_DOMAIN } from './supabase';
 import {
   apiGetSubdomains, apiCreateSubdomain, apiDeleteSubdomain,
-  apiGetFiles, apiDeleteFile, apiUploadFiles,
+  apiGetFiles, apiDeleteFile, apiDeleteAllFiles, apiUploadFiles, apiImportGitHub,
   type Subdomain, type FileInfo
 } from './api';
 import { toast, initToast, formatDate, formatBytes, fileIcon } from './utils';
@@ -227,7 +227,7 @@ function upload() {
           <h3>Drop files here</h3>
           <p>HTML, CSS, JS, images, or a <strong>ZIP archive</strong></p>
           <button class="btn btn-ghost" id="browseBtn">Browse Files</button>
-          <input type="file" id="fileInput" multiple hidden accept=".html,.css,.js,.ts,.json,.png,.jpg,.jpeg,.gif,.svg,.zip,.md,.txt,.ico,.woff,.woff2">
+          <input type="file" id="fileInput" multiple hidden>
         </div>
         ${pendingFiles.length ? `
           <div class="file-list" style="margin-top:16px">
@@ -249,6 +249,18 @@ function upload() {
             <button class="btn btn-ghost" id="clearBtn">Clear</button>
           </div>
         ` : ''}
+
+        <div class="github-import" style="margin-top: 32px; padding: 24px; background: rgba(255,255,255,0.03); border-radius: 12px; border: 1px solid var(--border);">
+          <h3 style="margin: 0 0 8px; font-size: 1.1rem; display: flex; align-items: center; gap: 8px;">
+            <svg height="24" width="24" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>
+            Import from GitHub
+          </h3>
+          <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 16px;">Instantly deploy a public GitHub repository. We will download the main branch and deploy it.</p>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="githubUrl" class="form-input" placeholder="https://github.com/username/repo" style="flex: 1;">
+            <button class="btn btn-primary" id="githubImportBtn">Import</button>
+          </div>
+        </div>
       </div>
 
       <div class="upload-sidebar">
@@ -259,17 +271,22 @@ function upload() {
           <div class="info-row"><span class="info-key">Created</span><span class="info-val">${formatDate(sub.created_at)}</span></div>
         </div>
         <div class="info-card">
-          <h4>📁 Uploaded Files (${activeFiles.length})</h4>
-          ${activeFiles.length === 0 ? '<p style="color:var(--text-muted);font-size:0.82rem">No files yet</p>' : `
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h4 style="margin:0;">📁 Uploaded Files (${activeFiles.length})</h4>
+            ${activeFiles.length > 0 ? `<button class="btn btn-danger btn-sm" id="deleteAllFilesBtn">Delete All</button>` : ''}
+          </div>
+          ${activeFiles.length === 0 ? '<p style="color:var(--text-muted);font-size:0.82rem;margin-top:12px;">No files yet</p>' : `
             <div class="files-list">
-              ${activeFiles.map(f => `
+              ${activeFiles.map(f => {
+                const isFolder = !f.id && !f.metadata?.size;
+                return `
                 <div class="managed-file">
-                  <span>${fileIcon(f.name)}</span>
+                  <span>${fileIcon(f.name, isFolder)}</span>
                   <span class="managed-file-name">${f.name}</span>
-                  <span style="font-size:0.75rem;color:var(--text-dim)">${formatBytes(f.metadata?.size ?? 0)}</span>
+                  <span style="font-size:0.75rem;color:var(--text-dim)">${isFolder ? 'Folder' : formatBytes(f.metadata?.size ?? 0)}</span>
                   <button class="file-remove del-file-btn" data-file="${f.name}" title="Delete">🗑️</button>
                 </div>
-              `).join('')}
+              `}).join('')}
             </div>
           `}
         </div>
@@ -431,6 +448,7 @@ function bindEvents() {
   );
   on('clearBtn', 'click', () => { pendingFiles = []; uploadProgress = 0; render(); });
   on('uploadBtn', 'click', doUpload);
+  on('githubImportBtn', 'click', doGithubImport);
 
   document.querySelectorAll<HTMLButtonElement>('.del-file-btn').forEach(btn =>
     btn.addEventListener('click', async () => {
@@ -443,6 +461,23 @@ function bindEvents() {
       } catch(err: any) { toast(err.message, 'error'); }
     })
   );
+
+  on('deleteAllFilesBtn', 'click', async () => {
+    if (!activeSubdomain) return;
+    if (!confirm(`Are you sure you want to delete ALL files and stop any running backend for "${activeSubdomain.name}"? This cannot be undone.`)) return;
+    const btn = document.getElementById('deleteAllFilesBtn') as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = 'Deleting...';
+    try {
+      await apiDeleteAllFiles(activeSubdomain.name);
+      toast('All files deleted successfully', 'success');
+      await loadFiles(activeSubdomain.name);
+    } catch(err: any) { 
+      toast(err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Delete All';
+    }
+  });
 }
 
 function addFiles(files: File[]) {
@@ -470,6 +505,37 @@ async function doUpload() {
     toast(err.message, 'error');
     btn.disabled = false; btn.textContent = `⚡ Upload ${pendingFiles.length} file${pendingFiles.length>1?'s':''}`;
     uploadProgress = 0; render();
+  }
+}
+
+async function doGithubImport() {
+  if (!activeSubdomain) return;
+  const input = document.getElementById('githubUrl') as HTMLInputElement;
+  const btn = document.getElementById('githubImportBtn') as HTMLButtonElement;
+  const url = input.value.trim();
+  
+  if (!url || !url.startsWith('https://github.com/')) {
+    toast('Please enter a valid GitHub URL', 'error');
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = 'Importing...';
+  
+  try {
+    const results = await apiImportGitHub(activeSubdomain.name, url);
+    const ok = results.filter(r => r.success).length;
+    const fail = results.filter(r => !r.success);
+    if (ok) toast(`✅ Imported ${ok} file${ok>1?'s':''} from GitHub`, 'success');
+    if (fail.length) fail.forEach(f => toast(`❌ ${f.file}: ${f.error}`, 'error'));
+    input.value = '';
+    await loadFiles(activeSubdomain.name);
+  } catch(err: any) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Import';
+    render();
   }
 }
 

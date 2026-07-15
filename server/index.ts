@@ -8,6 +8,14 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import JSZip from 'jszip';
 import 'dotenv/config';
+import { simpleGit } from 'simple-git';
+import { exec } from 'child_process';
+import util from 'util';
+import getFolderSize from 'get-folder-size';
+import pm2 from 'pm2';
+import { createProxyMiddleware } from 'http-proxy-middleware';
+
+const execAsync = util.promisify(exec);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +23,70 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 const MAIN_DOMAIN = process.env.MAIN_DOMAIN || 'alfacomp.uz';
+
+// Tracking running backends
+const activeBackends = new Map<string, number>();
+let nextPort = 4000;
+
+pm2.connect(err => {
+  if (err) {
+    console.error('Error connecting to PM2:', err);
+    return;
+  }
+  pm2.list((err, list) => {
+    if (!err && list) {
+      list.forEach(process => {
+        if (process.name && process.name.startsWith('sub-')) {
+          const subdomain = process.name.slice(4);
+          const pm2Env = process.pm2_env as any;
+          const port = pm2Env?.env?.PORT || pm2Env?.PORT;
+          if (port) {
+            activeBackends.set(subdomain, parseInt(port as string));
+            nextPort = Math.max(nextPort, parseInt(port as string) + 1);
+          }
+        }
+      });
+    }
+  });
+});
+
+const dangerousKeywords = [
+  'child_process', 'exec(', 'spawn(', 'fs.rmSync', 'fs.rmdirSync', 'eval('
+];
+
+function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
+  const files = fs.readdirSync(dirPath);
+  files.forEach(function(file) {
+    if (fs.statSync(dirPath + "/" + file).isDirectory()) {
+      if (file === 'node_modules' || file === '.git') return;
+      arrayOfFiles = getAllFiles(dirPath + "/" + file, arrayOfFiles);
+    } else {
+      arrayOfFiles.push(path.join(dirPath, "/", file));
+    }
+  });
+  return arrayOfFiles;
+}
+
+function scanDirectory(dir: string): boolean {
+  try {
+    const files = getAllFiles(dir);
+    for (const fullPath of files) {
+      if (fullPath.endsWith('.js') || fullPath.endsWith('.ts')) {
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        for (const keyword of dangerousKeywords) {
+          if (content.includes(keyword)) {
+             console.warn(`Dangerous keyword found: ${keyword} in ${fullPath}`);
+             return false;
+          }
+        }
+      }
+    }
+    return true;
+  } catch (err) {
+    console.error('Error scanning directory:', err);
+    return false;
+  }
+}
 
 // Supabase admin client (service key)
 const supabase = createClient(
@@ -109,6 +181,12 @@ app.use(async (req, res, next) => {
   }
 
   if (!subdomain || subdomain === 'www') return next();
+
+  // If backend is running, proxy to it
+  if (activeBackends.has(subdomain)) {
+    const target = `http://localhost:${activeBackends.get(subdomain)}`;
+    return createProxyMiddleware({ target, changeOrigin: true, ws: true })(req, res, next);
+  }
 
   // Check if subdomain exists
   const { data: sub } = await supabase
@@ -205,6 +283,16 @@ app.delete('/api/subdomains/:name', async (req, res) => {
     await supabase.storage.from('sites').remove(fileList.map(f => `${name}/${f.name}`));
   }
 
+  if (activeBackends.has(name)) {
+    await new Promise((resolve) => pm2.delete(`sub-${name}`, resolve));
+    activeBackends.delete(name);
+  }
+  
+  const appDir = path.join(__dirname, '../apps', name);
+  if (fs.existsSync(appDir)) {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
+
   // Call Render API to delete domain
   await removeRenderCustomDomain(`${name}.${MAIN_DOMAIN}`);
 
@@ -235,11 +323,29 @@ app.post('/api/subdomains/:name/upload', upload.array('files'), async (req, res)
     if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
       try {
         const zip = await JSZip.loadAsync(file.buffer);
+        
+        // Find if all files share a single root folder
+        const filePaths = Object.keys(zip.files).filter(p => !zip.files[p].dir);
+        let commonPrefix = '';
+        if (filePaths.length > 0) {
+          const firstParts = filePaths[0].split('/');
+          if (firstParts.length > 1) {
+            const potentialPrefix = firstParts[0] + '/';
+            if (filePaths.every(p => p.startsWith(potentialPrefix))) {
+              commonPrefix = potentialPrefix;
+            }
+          }
+        }
+
         for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
           if (zipEntry.dir) continue;
-          // Strip top-level folder if all files are inside one
-          const cleanPath = relativePath.replace(/^[^/]+\//, '');
+          
+          let cleanPath = relativePath;
+          if (commonPrefix && cleanPath.startsWith(commonPrefix)) {
+            cleanPath = cleanPath.slice(commonPrefix.length);
+          }
           if (!cleanPath) continue;
+          
           const content = await zipEntry.async('nodebuffer');
           const ct = mime.lookup(cleanPath) || 'application/octet-stream';
           const { error } = await supabase.storage
@@ -260,6 +366,129 @@ app.post('/api/subdomains/:name/upload', upload.array('files'), async (req, res)
   }
 
   res.json({ results });
+});
+
+// ─── API: Import from GitHub ────────────────────────────────────────────────
+app.post('/api/subdomains/:name/github', async (req, res) => {
+  const user = await getUser(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { name } = req.params;
+  const { repoUrl } = req.body;
+
+  if (!repoUrl || !repoUrl.startsWith('https://github.com/')) {
+    return res.status(400).json({ error: 'Invalid GitHub URL. Must start with https://github.com/' });
+  }
+
+  const { data: sub } = await supabase
+    .from('subdomains')
+    .select('id')
+    .eq('name', name)
+    .eq('user_id', user.id)
+    .single();
+
+  if (!sub) return res.status(403).json({ error: 'Forbidden' });
+
+  const appsDir = path.join(__dirname, '../apps');
+  if (!fs.existsSync(appsDir)) fs.mkdirSync(appsDir);
+  const appDir = path.join(appsDir, name);
+
+  try {
+    if (fs.existsSync(appDir)) {
+      fs.rmSync(appDir, { recursive: true, force: true });
+    }
+
+    const git = simpleGit();
+    await git.clone(repoUrl, appDir);
+
+    const folderSize = await getFolderSize.loose(appDir);
+    if (folderSize > 50 * 1024 * 1024) { // 50MB
+      fs.rmSync(appDir, { recursive: true, force: true });
+      return res.status(400).json({ error: 'Repository exceeds 50MB limit.' });
+    }
+
+    if (!scanDirectory(appDir)) {
+      fs.rmSync(appDir, { recursive: true, force: true });
+      return res.status(400).json({ error: 'Security Violation: Suspicious code found. For security, certain functions are disabled.' });
+    }
+
+    const pkgPath = path.join(appDir, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      
+      if (activeBackends.has(name)) {
+        await new Promise((resolve) => pm2.delete(`sub-${name}`, resolve));
+        activeBackends.delete(name);
+      }
+
+      await execAsync('npm install', { cwd: appDir });
+
+      if (pkg.scripts && pkg.scripts.build) {
+        await execAsync('npm run build', { cwd: appDir });
+      }
+
+      if (pkg.scripts && pkg.scripts.start) {
+        const port = nextPort++;
+        await new Promise<void>((resolve, reject) => {
+          pm2.start({
+            name: `sub-${name}`,
+            script: 'npm',
+            args: 'start',
+            cwd: appDir,
+            env: { PORT: port.toString() }
+          }, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        activeBackends.set(name, port);
+        return res.json({ results: [{ file: 'Backend Server started on port ' + port, success: true }] });
+      } else {
+        // Upload static files from output dir
+        const outDirs = ['dist', 'build', 'out'];
+        let uploadDir = appDir;
+        for (const dir of outDirs) {
+          if (fs.existsSync(path.join(appDir, dir))) {
+            uploadDir = path.join(appDir, dir);
+            break;
+          }
+        }
+        
+        const filesToUpload = getAllFiles(uploadDir);
+        const results: { file: string; success: boolean; error?: string }[] = [];
+        for (const fullPath of filesToUpload) {
+           const relativePath = path.relative(uploadDir, fullPath).replace(/\\/g, '/');
+           const content = fs.readFileSync(fullPath);
+           const ct = mime.lookup(relativePath) || 'application/octet-stream';
+           const { error } = await supabase.storage.from('sites').upload(`${name}/${relativePath}`, content, { contentType: ct as string, upsert: true });
+           results.push({ file: relativePath, success: !error, error: error?.message });
+        }
+        fs.rmSync(appDir, { recursive: true, force: true });
+        return res.json({ results });
+      }
+    } else {
+      // Just HTML files (no package.json)
+      const filesToUpload = getAllFiles(appDir);
+      const results: { file: string; success: boolean; error?: string }[] = [];
+      for (const fullPath of filesToUpload) {
+         if (fullPath.includes('.git')) continue;
+         const relativePath = path.relative(appDir, fullPath).replace(/\\/g, '/');
+         const content = fs.readFileSync(fullPath);
+         const ct = mime.lookup(relativePath) || 'application/octet-stream';
+         const { error } = await supabase.storage.from('sites').upload(`${name}/${relativePath}`, content, { contentType: ct as string, upsert: true });
+         results.push({ file: relativePath, success: !error, error: error?.message });
+      }
+      fs.rmSync(appDir, { recursive: true, force: true });
+      return res.json({ results });
+    }
+  } catch (error: any) {
+    const appsDir = path.join(__dirname, '../apps');
+    const appDir = path.join(appsDir, name);
+    if (fs.existsSync(appDir)) {
+      try { fs.rmSync(appDir, { recursive: true, force: true }); } catch (e) {}
+    }
+    res.status(500).json({ error: error.message || 'Failed to process GitHub repository' });
+  }
 });
 
 // ─── API: List files in subdomain ─────────────────────────────────────────────
@@ -286,12 +515,13 @@ app.get('/api/subdomains/:name/files', async (req, res) => {
   res.json(data || []);
 });
 
-// ─── API: Delete file ─────────────────────────────────────────────────────────
-app.delete('/api/subdomains/:name/files/:filename', async (req, res) => {
+// ─── API: Delete file or folder ───────────────────────────────────────────────
+app.delete('/api/subdomains/:name/files/*', async (req, res) => {
   const user = await getUser(req.headers.authorization);
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { name, filename } = req.params;
+  const name = req.params.name;
+  const filename = (req.params as any)[0];
 
   const { data: sub } = await supabase
     .from('subdomains')
@@ -302,8 +532,81 @@ app.delete('/api/subdomains/:name/files/:filename', async (req, res) => {
 
   if (!sub) return res.status(403).json({ error: 'Forbidden' });
 
-  const { error } = await supabase.storage.from('sites').remove([`${name}/${filename}`]);
-  if (error) return res.status(500).json({ error: error.message });
+  const fullPath = `${name}/${filename}`;
+
+  async function deleteRecursive(prefix: string) {
+    const { data, error } = await supabase.storage.from('sites').list(prefix, { limit: 500 });
+    if (error || !data || data.length === 0) return;
+    
+    const files = [];
+    for (const item of data) {
+      if (item.id === null) {
+        await deleteRecursive(`${prefix}/${item.name}`);
+      } else {
+        files.push(`${prefix}/${item.name}`);
+      }
+    }
+    if (files.length > 0) {
+      await supabase.storage.from('sites').remove(files);
+    }
+  }
+
+  // 1. Try to delete as a single file
+  await supabase.storage.from('sites').remove([fullPath]);
+  
+  // 2. Try to delete recursively as a folder
+  await deleteRecursive(fullPath);
+
+  res.json({ success: true });
+});
+
+// ─── API: Delete all files ────────────────────────────────────────────────────
+app.delete('/api/subdomains/:name/files', async (req, res) => {
+  const user = await getUser(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { name } = req.params;
+
+  const { data: sub } = await supabase
+    .from('subdomains')
+    .select('id')
+    .eq('name', name)
+    .eq('user_id', user.id)
+    .single();
+
+  if (!sub) return res.status(403).json({ error: 'Forbidden' });
+
+  // Recursive delete helper
+  async function deleteRecursive(prefix: string) {
+    const { data, error } = await supabase.storage.from('sites').list(prefix, { limit: 500 });
+    if (error || !data || data.length === 0) return;
+    
+    const files = [];
+    for (const item of data) {
+      if (item.id === null) {
+        await deleteRecursive(`${prefix}/${item.name}`);
+      } else {
+        files.push(`${prefix}/${item.name}`);
+      }
+    }
+    if (files.length > 0) {
+      await supabase.storage.from('sites').remove(files);
+    }
+  }
+
+  // Delete all storage files recursively
+  await deleteRecursive(name);
+
+  if (activeBackends.has(name)) {
+    await new Promise((resolve) => pm2.delete(`sub-${name}`, resolve));
+    activeBackends.delete(name);
+  }
+  
+  const appDir = path.join(__dirname, '../apps', name);
+  if (fs.existsSync(appDir)) {
+    try { fs.rmSync(appDir, { recursive: true, force: true }); } catch (e) {}
+  }
+
   res.json({ success: true });
 });
 

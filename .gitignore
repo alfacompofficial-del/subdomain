@@ -4,3 +4,5 @@ dist-server
 .env
 .env.local
 *.local
+apps
+__github_tmp
